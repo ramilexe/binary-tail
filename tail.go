@@ -5,6 +5,7 @@ package tail
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -29,11 +30,12 @@ type Line struct {
 	Text string
 	Time time.Time
 	Err  error // Error from tail
+	Data []byte
 }
 
 // NewLine returns a Line with present time.
 func NewLine(text string) *Line {
-	return &Line{text, time.Now(), nil}
+	return &Line{text, time.Now(), nil, []byte{}}
 }
 
 // SeekInfo represents arguments to `os.Seek`
@@ -62,6 +64,7 @@ type Config struct {
 	MustExist   bool      // Fail early if the file does not exist
 	Poll        bool      // Poll for file changes instead of using inotify
 	Pipe        bool      // Is a named pipe (mkfifo)
+	Binary      bool      // Read as binary file
 	RateLimiter *ratelimiter.LeakyBucket
 
 	// Generic IO
@@ -223,6 +226,30 @@ func (tail *Tail) readLine() (string, error) {
 	return line, err
 }
 
+func (tail *Tail) readBinary() ([]byte, error) {
+	tail.lk.Lock()
+
+	var err error
+	totalBuf := &bytes.Buffer{}
+	b := make([]byte, 10240)
+	for {
+		n, err := tail.reader.Read(b)
+
+		if n > 0 {
+			data := b[:n]
+			//append
+			totalBuf.Write(data)
+		}
+
+		if err != nil {
+			break
+		}
+	}
+	tail.lk.Unlock()
+
+	return totalBuf.Bytes(), err
+}
+
 func (tail *Tail) tailFileSync() {
 	defer tail.Done()
 	defer tail.close()
@@ -265,17 +292,30 @@ func (tail *Tail) tailFileSync() {
 			}
 		}
 
-		line, err := tail.readLine()
+		var binData []byte
+		var line string
+
+		if tail.Binary {
+			binData, err = tail.readBinary()
+		} else {
+			line, err = tail.readLine()
+		}
 
 		// Process `line` even if err is EOF.
 		if err == nil {
-			cooloff := !tail.sendLine(line)
+			var cooloff bool
+
+			if tail.Binary {
+				cooloff = !tail.sendBinary(binData)
+			} else {
+				cooloff = !tail.sendLine(line)
+			}
 			if cooloff {
 				// Wait a second before seeking till the end of
 				// file when rate limit is reached.
 				msg := ("Too much log activity; waiting a second " +
 					"before resuming tailing")
-				tail.Lines <- &Line{msg, time.Now(), errors.New(msg)}
+				tail.Lines <- &Line{msg, time.Now(), errors.New(msg), []byte{}}
 				select {
 				case <-time.After(time.Second):
 				case <-tail.Dying():
@@ -288,9 +328,16 @@ func (tail *Tail) tailFileSync() {
 			}
 		} else if err == io.EOF {
 			if !tail.Follow {
-				if line != "" {
-					tail.sendLine(line)
+				if tail.Binary {
+					if len(binData) > 0 {
+						tail.sendBinary(binData)
+					}
+				} else {
+					if line != "" {
+						tail.sendLine(line)
+					}
 				}
+
 				return
 			}
 
@@ -414,7 +461,7 @@ func (tail *Tail) sendLine(line string) bool {
 	}
 
 	for _, line := range lines {
-		tail.Lines <- &Line{line, now, nil}
+		tail.Lines <- &Line{line, now, nil, []byte{}}
 	}
 
 	if tail.Config.RateLimiter != nil {
@@ -424,6 +471,16 @@ func (tail *Tail) sendLine(line string) bool {
 				tail.Filename)
 			return false
 		}
+	}
+
+	return true
+}
+
+func (tail *Tail) sendBinary(data []byte) bool {
+	now := time.Now()
+
+	if len(data) > 0 {
+		tail.Lines <- &Line{"", now, nil, data}
 	}
 
 	return true
